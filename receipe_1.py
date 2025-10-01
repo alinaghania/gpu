@@ -1,8 +1,9 @@
 """
-RECIPE 1 — EVENTS SAMPLED (FAST)
+RECIPE 1 — EVENTS SAMPLED (FAST & ROBUST)
 ----------------------------------------------
 But: construire un tout petit échantillon récent pour smoke-test end-to-end,
-en maximisant la vitesse (pas de rescans par mois, stop early dès quota atteint).
+en maximisant la vitesse (pas de rescans par mois, stop early dès quota atteint),
+et en étant TOLÉRANT aux specs de partitions Dataiku.
 
 Entrée : BASE_SCORE_COMPLETE_prepared
 Sortie : events_sampled
@@ -35,7 +36,7 @@ EXTRA_EVENT_COLS = []  # ex: ["CANAL", "FAMILLE"]
 LIMIT_ROWS         = 400          # tiny
 MONTHS_BACK_TARGET = 2            # 1-2 mois récents suffisent pour un test
 MIN_CLIENT_MONTHS  = 1            # tolérant
-EXCLUDE_ON_EVENTS  = False        # <<< pas d'exclusion pour aller VITE
+EXCLUDE_ON_EVENTS  = False        # pas d'exclusion pour aller VITE
 
 # Lecture streaming
 CHUNKSIZE          = 200_000      # gros chunks pour réduire overhead
@@ -81,6 +82,33 @@ def _month_minus(month_str: str, k: int) -> str:
     return (p - k).strftime("%Y-%m")
 
 
+def _try_read_partition(ds: dataiku.Dataset, p: str, need_cols: List[str]) -> pd.DataFrame:
+    """
+    Essaie plusieurs formats de spec partitions:
+      - "2025-05"
+      - "DATMAJ=2025-05"
+      - "month=2025-05"
+      - "PARTITION_MONTH=2025-05"
+    Retourne un DF (possiblement vide). Ne lève pas.
+    """
+    candidates = [p, f"{TIME_COL}={p}", f"month={p}", f"PARTITION_MONTH={p}"]
+    for spec in candidates:
+        try:
+            df = ds.get_dataframe(partitions=spec, limit=None, parse_dates=False, infer_with_pandas=True)
+            if df is not None and len(df) > 0:
+                df["_PART_SPEC_USED_"] = spec
+                # si les colonnes demandées n'existent pas, on lira toutes puis on filtrera après
+                missing = [c for c in need_cols if c not in df.columns]
+                if missing:
+                    # relit sans restriction de colonnes (certaines FS ne gèrent pas "columns=" avec partitions)
+                    df = ds.get_dataframe(partitions=spec, limit=None, parse_dates=False, infer_with_pandas=True)
+                    df["_PART_SPEC_USED_"] = spec
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
 def _stream_filter_last_months(ds: dataiku.Dataset, min_month_inclusive: str,
                                limit_rows: int, exclude_class: bool) -> pd.DataFrame:
     """2e pass : filtre en streaming sur les derniers mois, stop early dès LIMIT_ROWS atteint."""
@@ -106,14 +134,8 @@ def _stream_filter_last_months(ds: dataiku.Dataset, min_month_inclusive: str,
             continue
 
         # rename & keep
-        keep_cols = {
-            CLIENT_ID_COL: "CLIENT_ID",
-            "DATE_EVENT": "DATE_EVENT",
-            PRODUCT_COL: "PRODUCT_CODE",
-            "PARTITION_MONTH": "PARTITION_MONTH"
-        }
-        ch = ch.rename(columns=keep_cols)[list(keep_cols.values()) + list(EXTRA_EVENT_COLS)]
-        out.append(ch)
+        ch = ch.rename(columns={CLIENT_ID_COL: "CLIENT_ID", PRODUCT_COL: "PRODUCT_CODE"})
+        out.append(ch[["CLIENT_ID", "DATE_EVENT", "PRODUCT_CODE", "PARTITION_MONTH"] + list(EXTRA_EVENT_COLS)])
         total += len(ch)
 
         if total >= limit_rows:
@@ -139,40 +161,56 @@ def main():
 
     parts = _list_partitions_if_any(ds_in)
     if parts:
-        # Lecture directe des dernières partitions seulement
         target_parts = parts[:max(1, MONTHS_BACK_TARGET)]
         log.info(f"Partitions détectées → on lit: {target_parts}")
-        cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+
+        need_cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
         chunks = []
         for p in target_parts:
-            try:
-                ch = ds_in.get_dataframe(partitions=p, columns=cols, limit=None,
-                                         parse_dates=False, infer_with_pandas=True)
-                if ch.empty:
-                    continue
-                ch["DATE_EVENT"] = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
-                ch = ch.dropna(subset=[CLIENT_ID_COL, "DATE_EVENT", PRODUCT_COL])
-                if EXCLUDE_ON_EVENTS:
-                    ch = ch[ch[PRODUCT_COL].astype(str).str.strip() != "Aucune_Proposition"]
-                if ch.empty:
-                    continue
-                ch["PARTITION_MONTH"] = p if isinstance(p, str) else str(p)
-                ch = ch.rename(columns={CLIENT_ID_COL:"CLIENT_ID", PRODUCT_COL:"PRODUCT_CODE"})
-                chunks.append(ch[["CLIENT_ID","DATE_EVENT","PRODUCT_CODE","PARTITION_MONTH"] + list(EXTRA_EVENT_COLS)])
-            except Exception:
+            dfp = _try_read_partition(ds_in, p, need_cols)
+            if dfp.empty:
+                log.warning(f"Partition '{p}' lue vide (ou spec incompatible). On passe.")
                 continue
-        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=["CLIENT_ID","DATE_EVENT","PRODUCT_CODE","PARTITION_MONTH"]+list(EXTRA_EVENT_COLS))
-        if df.empty:
-            raise RuntimeError("Partitions trouvées mais aucun enregistrement lisible.")
 
-        # équilibre simple et tronque
-        df["_m"] = df["PARTITION_MONTH"]
-        per_m = max(1, int(np.ceil(LIMIT_ROWS / max(1, df["_m"].nunique()))))
-        df = (df.groupby("_m", group_keys=False).apply(lambda g: g.head(per_m))).drop(columns=["_m"])
-        df = (df.sort_values(["CLIENT_ID","DATE_EVENT"])
-                .drop_duplicates(subset=["CLIENT_ID","DATE_EVENT"], keep="last")
-                .head(LIMIT_ROWS)
-                .reset_index(drop=True))
+            # harmonise colonnes
+            if CLIENT_ID_COL not in dfp.columns or TIME_COL not in dfp.columns or PRODUCT_COL not in dfp.columns:
+                # on tente des alias fréquents (si besoin tu peux en ajouter)
+                alias_map = {}
+                # rien par défaut ; on s'appuie sur TIME_COL/CLIENT_ID_COL/PRODUCT_COL fournis
+                # -> si absent, on abandonne cette partition
+                missing = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
+                has_all = all(c in dfp.columns for c in missing)
+                if not has_all:
+                    log.warning(f"Colonnes requises absentes dans partition '{p}' (spec {dfp.get('_PART_SPEC_USED_', ['?'])[0]}). Skip.")
+                    continue
+
+            # parse / filtre
+            dfp["DATE_EVENT"] = pd.to_datetime(dfp[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
+            dfp = dfp.dropna(subset=[CLIENT_ID_COL, "DATE_EVENT", PRODUCT_COL])
+            if dfp.empty:
+                continue
+
+            if EXCLUDE_ON_EVENTS:
+                dfp = dfp[dfp[PRODUCT_COL].astype(str).str.strip() != "Aucune_Proposition"]
+
+            if dfp.empty:
+                continue
+
+            dfp["PARTITION_MONTH"] = dfp["DATE_EVENT"].dt.to_period("M").astype(str)
+            dfp = dfp.rename(columns={CLIENT_ID_COL: "CLIENT_ID", PRODUCT_COL: "PRODUCT_CODE"})
+            chunks.append(dfp[["CLIENT_ID", "DATE_EVENT", "PRODUCT_CODE", "PARTITION_MONTH"] + list(EXTRA_EVENT_COLS)])
+
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=["CLIENT_ID","DATE_EVENT","PRODUCT_CODE","PARTITION_MONTH"]+list(EXTRA_EVENT_COLS))
+
+        if df.empty:
+            log.error("Partitions détectées mais rien de lisible — on bascule en mode scan rapide (fallback).")
+            # Fallback global: 2 passes (mois max, puis streaming filtré)
+            max_month = _find_max_month_by_scan(ds_in)
+            if not max_month:
+                raise RuntimeError("Impossible de déterminer le mois max (TIME_COL vide ?).")
+            start_month = _month_minus(max_month, MONTHS_BACK_TARGET-1)
+            log.info(f"Fallback streaming. max_month={max_month} | start_month={start_month}")
+            df = _stream_filter_last_months(ds_in, start_month, LIMIT_ROWS, EXCLUDE_ON_EVENTS)
     else:
         # Pas de partitions => 2 passes max (mois max, puis stream filtré)
         max_month = _find_max_month_by_scan(ds_in)
@@ -196,4 +234,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
