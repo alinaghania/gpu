@@ -1,250 +1,197 @@
 """
-RECIPE 1 — EVENTS SAMPLED (fast & tiny)
+RECIPE 1 — EVENTS SAMPLED (FAST)
 ----------------------------------------------
-Lit un petit échantillon d'événements depuis BASE_SCORE_COMPLETE_prepared
-sur les derniers mois (3 par défaut), exclut "Aucune_Proposition" (optionnel),
-déduplique (CLIENT_ID, DATE_EVENT), et écrit un dataset prêt pour le SequenceBuilder.
+But: construire un tout petit échantillon récent pour smoke-test end-to-end,
+en maximisant la vitesse (pas de rescans par mois, stop early dès quota atteint).
 
-Sortie: dataset "events_sampled"
-Schema (inféré) :
-- CLIENT_ID        (string ou bigint selon tes données)
-- DATE_EVENT       (timestamp)
-- PRODUCT_CODE     (string)
-- PARTITION_MONTH  (string, format "YYYY-MM")
+Entrée : BASE_SCORE_COMPLETE_prepared
+Sortie : events_sampled
 
-NOTE: paramétrage mini pour lancer un smoke-test end-to-end rapidement.
+Colonnes de sortie :
+- CLIENT_ID
+- DATE_EVENT (timestamp naïf)
+- PRODUCT_CODE
+- PARTITION_MONTH (YYYY-MM)
 """
 
-import os, sys, logging
+import sys, logging
 from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
 import dataiku
 
-# ===================== PARAMS UTILISATEUR =========================
-DATASET_MAIN          = "BASE_SCORE_COMPLETE_prepared"   # input
-OUTPUT_DATASET_NAME   = "events_sampled"                 # output
+# ===================== PARAMS =========================
+DATASET_MAIN        = "BASE_SCORE_COMPLETE_prepared"
+OUTPUT_DATASET_NAME = "events_sampled"
 
-# Colonnes source (doivent matcher la base)
-CLIENT_ID_COL         = "NUMTECPRS"
-TIME_COL              = "DATMAJ"                         # date/mois
-PRODUCT_COL           = "SOUSCRIPTION_PRODUIT_1M"
-EXTRA_EVENT_COLS      = []                               # ex: ["CANAL", "FAMILLE"]
+# Colonnes source
+CLIENT_ID_COL    = "NUMTECPRS"
+TIME_COL         = "DATMAJ"
+PRODUCT_COL      = "SOUSCRIPTION_PRODUIT_1M"
+EXTRA_EVENT_COLS = []  # ex: ["CANAL", "FAMILLE"]
 
-# Échantillonnage ultra-light
-LIMIT_ROWS            = 400          # <= très petit pour un run rapide
-MONTHS_BACK_TARGET    = 3            # derniers N mois à viser
-PER_MONTH_CAP         = None         # auto (LIMIT_ROWS // MONTHS_BACK_TARGET)
-MIN_CLIENT_MONTHS     = 1            # tolérant : au moins 1 pas de temps
-EXCLUDE_ON_EVENTS     = True         # exclure "Aucune_Proposition"
-RANDOM_SEED           = 42
+# Échantillon minuscule et récent
+LIMIT_ROWS         = 400          # tiny
+MONTHS_BACK_TARGET = 2            # 1-2 mois récents suffisent pour un test
+MIN_CLIENT_MONTHS  = 1            # tolérant
+EXCLUDE_ON_EVENTS  = False        # <<< pas d'exclusion pour aller VITE
 
-# Lecture en chunks (utile si dataset non partitionné)
-READ_IN_CHUNKS        = True
-CHUNKSIZE             = 5_000
+# Lecture streaming
+CHUNKSIZE          = 200_000      # gros chunks pour réduire overhead
+RANDOM_SEED        = 42
 
-# ===================== LOGGING =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("recipe1")
+log = logging.getLogger("recipe1_fast")
 
 
-# ===================== HELPERS =========================
-def _to_month_label(p) -> str:
-    try:
-        return pd.to_datetime(p).strftime("%Y-%m")
-    except Exception:
-        s = str(p)
-        if len(s) == 7 and s[4] == "-":
-            return s
-        if len(s) in (6, 8) and s[:4].isdigit():
-            return f"{s[:4]}-{s[4:6]}"
-        return s
+def _to_month_label(dt_series: pd.Series) -> pd.Series:
+    return pd.to_datetime(dt_series, errors="coerce", utc=True).dt.tz_convert(None).dt.to_period("M").astype(str)
 
 
-def _list_month_partitions(ds: dataiku.Dataset) -> List[str]:
-    """Essaie d'abord les partitions DSS, sinon infère via la colonne date."""
-    # 1) Partitions DSS
+def _list_partitions_if_any(ds: dataiku.Dataset) -> List[str]:
     try:
         parts = ds.list_partitions()
         parts = sorted(parts, reverse=True)
-        if parts:
-            return [_to_month_label(x) for x in parts]
+        return parts
     except Exception:
-        pass
+        return []
 
-    # 2) Fallback: inférence via DATMAJ
-    months = set()
-    cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL]
+
+def _find_max_month_by_scan(ds: dataiku.Dataset) -> Optional[str]:
+    """1 pass légère (TIME_COL only) pour trouver le mois max si pas de partitions."""
+    max_month = None
+    for ch in ds.iter_dataframes(columns=[TIME_COL], chunksize=CHUNKSIZE,
+                                 parse_dates=False, infer_with_pandas=True):
+        m = _to_month_label(ch[TIME_COL]).dropna()
+        if not m.empty:
+            mm = m.max()
+            if (max_month is None) or (mm > max_month):
+                max_month = mm
+    return max_month
+
+
+def _month_minus(month_str: str, k: int) -> str:
+    # month_str "YYYY-MM" -> subtract k months
+    p = pd.Period(month_str, freq="M")
+    return (p - k).strftime("%Y-%m")
+
+
+def _stream_filter_last_months(ds: dataiku.Dataset, min_month_inclusive: str,
+                               limit_rows: int, exclude_class: bool) -> pd.DataFrame:
+    """2e pass : filtre en streaming sur les derniers mois, stop early dès LIMIT_ROWS atteint."""
+    cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+    out = []
+    total = 0
+
     for ch in ds.iter_dataframes(columns=cols, chunksize=CHUNKSIZE,
                                  parse_dates=False, infer_with_pandas=True):
-        dt = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
-        months.update(dt.dropna().dt.to_period("M").astype(str).unique().tolist())
-        if len(months) >= 48:  # on limite la découverte
+        # parse date & month
+        ch["DATE_EVENT"] = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
+        ch = ch.dropna(subset=[CLIENT_ID_COL, "DATE_EVENT", PRODUCT_COL])
+        if ch.empty:
+            continue
+
+        ch["PARTITION_MONTH"] = ch["DATE_EVENT"].dt.to_period("M").astype(str)
+        ch = ch[ch["PARTITION_MONTH"] >= min_month_inclusive]
+
+        if exclude_class:
+            ch = ch[ch[PRODUCT_COL].astype(str).str.strip() != "Aucune_Proposition"]
+
+        if ch.empty:
+            continue
+
+        # rename & keep
+        keep_cols = {
+            CLIENT_ID_COL: "CLIENT_ID",
+            "DATE_EVENT": "DATE_EVENT",
+            PRODUCT_COL: "PRODUCT_CODE",
+            "PARTITION_MONTH": "PARTITION_MONTH"
+        }
+        ch = ch.rename(columns=keep_cols)[list(keep_cols.values()) + list(EXTRA_EVENT_COLS)]
+        out.append(ch)
+        total += len(ch)
+
+        if total >= limit_rows:
             break
-    return sorted(list(months), reverse=True)
 
+    if not out:
+        return pd.DataFrame(columns=["CLIENT_ID", "DATE_EVENT", "PRODUCT_CODE", "PARTITION_MONTH"] + list(EXTRA_EVENT_COLS))
 
-def _read_month_sample(
-    ds: dataiku.Dataset,
-    month_label: str,
-    per_month_cap: Optional[int],
-    exclude_on_events: bool
-) -> pd.DataFrame:
-    """Lit un mois (partition ou filtre DATMAJ) et fait le nettoyage minimal."""
-    cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
-
-    # 1) Tentative partitions
-    try:
-        df = ds.get_dataframe(partitions=month_label, columns=cols,
-                              limit=None, parse_dates=False, infer_with_pandas=True)
-    except Exception:
-        # 2) Fallback: filtre DATMAJ = month_label en chunks
-        dfs = []
-        for ch in ds.iter_dataframes(columns=cols, chunksize=CHUNKSIZE,
-                                     parse_dates=False, infer_with_pandas=True):
-            dt = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
-            ch = ch.loc[dt.dt.to_period("M").astype(str) == month_label, cols]
-            if not ch.empty:
-                dfs.append(ch)
-        df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=cols)
-
-    if df.empty:
-        return df
-
-    # Parse & clean
-    df = df.rename(columns={
-        CLIENT_ID_COL: "CLIENT_ID",
-        TIME_COL: "DATE_EVENT",
-        PRODUCT_COL: "PRODUCT_CODE"
-    })
-    df["DATE_EVENT"] = pd.to_datetime(df["DATE_EVENT"], errors="coerce", utc=True).dt.tz_convert(None)
-    df = df.dropna(subset=["CLIENT_ID", "DATE_EVENT"])
-
-    if exclude_on_events:
-        df = df[df["PRODUCT_CODE"].astype(str).strip() != "Aucune_Proposition"]
-
-    if df.empty:
-        return df
-
-    # Dédup stricte (CLIENT_ID, DATE_EVENT)
+    df = pd.concat(out, ignore_index=True)
+    # dédup stricte + head LIMIT_ROWS
     df = (df.sort_values(["CLIENT_ID", "DATE_EVENT"])
-            .drop_duplicates(subset=["CLIENT_ID", "DATE_EVENT"], keep="last"))
-
-    # Cap par mois
-    if per_month_cap and len(df) > per_month_cap:
-        df = df.sample(n=per_month_cap, random_state=RANDOM_SEED)
-
+            .drop_duplicates(subset=["CLIENT_ID", "DATE_EVENT"], keep="last")
+            .head(limit_rows)
+            .reset_index(drop=True))
     return df
 
 
-def build_events_stratified(
-    limit_rows: int,
-    months_back: int,
-    per_month_cap: Optional[int],
-    min_client_months: int,
-    exclude_on_events: bool
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    ds = dataiku.Dataset(DATASET_MAIN)
-    months_all = _list_month_partitions(ds)
-    if not months_all:
-        raise RuntimeError("Impossible de déterminer les mois disponibles (partitions/DATMAJ).")
-
-    target_months = months_all[:max(1, months_back)]
-    if not per_month_cap or per_month_cap <= 0:
-        per_month_cap = max(50, limit_rows // max(1, len(target_months)))
-
-    log.info(f"[STEP1] limit_rows={limit_rows:,} | keep_months={months_back} | per_month_cap={per_month_cap} | exclude={exclude_on_events}")
-
-    # Lecture stratifiée par mois
-    chunks = []
-    total = 0
-    for m in target_months:
-        dfm = _read_month_sample(ds, m, per_month_cap=per_month_cap, exclude_on_events=exclude_on_events)
-        if not dfm.empty:
-            dfm["PARTITION_MONTH"] = m
-            chunks.append(dfm)
-            total += len(dfm)
-        if total >= limit_rows * 2:
-            break
-
-    base_cols = ["CLIENT_ID", "DATE_EVENT", "PRODUCT_CODE", "PARTITION_MONTH"] + list(EXTRA_EVENT_COLS)
-    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=base_cols)
-
-    # Fallbacks si trop vide
-    if df.empty and exclude_on_events:
-        log.warning("Vide après exclusion — retry sans exclusion sur les mêmes mois.")
-        chunks = []
-        for m in target_months:
-            dfm = _read_month_sample(ds, m, per_month_cap=per_month_cap, exclude_on_events=False)
-            if not dfm.empty:
-                dfm["PARTITION_MONTH"] = m
-                chunks.append(dfm)
-        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=base_cols)
-
-    if df.empty:
-        raise RuntimeError("Aucun événement trouvé après fallback.")
-
-    # Profondeur min par client (très permissif ici)
-    tmp = df.copy()
-    tmp["_m"] = tmp["DATE_EVENT"].dt.to_period("M")
-    keep_ids = tmp.groupby("CLIENT_ID")["_m"].nunique()
-    keep_ids = set(keep_ids[keep_ids >= min_client_months].index)
-    df_kept = tmp[tmp["CLIENT_ID"].isin(keep_ids)].drop(columns=["_m"])
-    if df_kept.empty:
-        df_kept = tmp.drop(columns=["_m"])
-
-    # Équilibrage par mois + tronque à LIMIT_ROWS
-    df_kept["_month"] = df_kept["DATE_EVENT"].dt.to_period("M").astype(str)
-    n_target_months = df_kept["_month"].nunique()
-    per_m = max(1, int(np.ceil(limit_rows / max(1, n_target_months))))
-    df_kept = (df_kept.groupby("_month", group_keys=False).apply(lambda g: g.head(per_m)))
-    df_kept = df_kept.drop(columns=["_month"]).head(limit_rows).reset_index(drop=True)
-
-    # Stats
-    n_clients = df_kept["CLIENT_ID"].nunique()
-    n_months  = df_kept["DATE_EVENT"].dt.to_period("M").nunique()
-    meta = {
-        "selected_months": target_months,
-        "per_month_cap": per_month_cap,
-        "exclude_on_events": exclude_on_events,
-        "n_clients": int(n_clients),
-        "n_months": int(n_months),
-        "rows": int(len(df_kept)),
-    }
-    return df_kept, meta
-
-
-# ===================== MAIN (RECIPE) =========================
 def main():
     np.random.seed(RANDOM_SEED)
-
-    log.info("=== RECIPE 1 START (events sampled) ===")
+    log.info("=== RECIPE 1 FAST START ===")
+    ds_in = dataiku.Dataset(DATASET_MAIN)
     ds_out = dataiku.Dataset(OUTPUT_DATASET_NAME)
 
-    df_events, meta = build_events_stratified(
-        limit_rows=LIMIT_ROWS,
-        months_back=MONTHS_BACK_TARGET,
-        per_month_cap=PER_MONTH_CAP,
-        min_client_months=MIN_CLIENT_MONTHS,
-        exclude_on_events=EXCLUDE_ON_EVENTS
-    )
+    parts = _list_partitions_if_any(ds_in)
+    if parts:
+        # Lecture directe des dernières partitions seulement
+        target_parts = parts[:max(1, MONTHS_BACK_TARGET)]
+        log.info(f"Partitions détectées → on lit: {target_parts}")
+        cols = [CLIENT_ID_COL, TIME_COL, PRODUCT_COL] + list(EXTRA_EVENT_COLS)
+        chunks = []
+        for p in target_parts:
+            try:
+                ch = ds_in.get_dataframe(partitions=p, columns=cols, limit=None,
+                                         parse_dates=False, infer_with_pandas=True)
+                if ch.empty:
+                    continue
+                ch["DATE_EVENT"] = pd.to_datetime(ch[TIME_COL], errors="coerce", utc=True).dt.tz_convert(None)
+                ch = ch.dropna(subset=[CLIENT_ID_COL, "DATE_EVENT", PRODUCT_COL])
+                if EXCLUDE_ON_EVENTS:
+                    ch = ch[ch[PRODUCT_COL].astype(str).str.strip() != "Aucune_Proposition"]
+                if ch.empty:
+                    continue
+                ch["PARTITION_MONTH"] = p if isinstance(p, str) else str(p)
+                ch = ch.rename(columns={CLIENT_ID_COL:"CLIENT_ID", PRODUCT_COL:"PRODUCT_CODE"})
+                chunks.append(ch[["CLIENT_ID","DATE_EVENT","PRODUCT_CODE","PARTITION_MONTH"] + list(EXTRA_EVENT_COLS)])
+            except Exception:
+                continue
+        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=["CLIENT_ID","DATE_EVENT","PRODUCT_CODE","PARTITION_MONTH"]+list(EXTRA_EVENT_COLS))
+        if df.empty:
+            raise RuntimeError("Partitions trouvées mais aucun enregistrement lisible.")
 
-    log.info(f"Rows={meta['rows']:,} | Clients={meta['n_clients']:,} | Months={meta['n_months']}")
-    try:
-        vc = df_events["PRODUCT_CODE"].astype(str).value_counts().head(10)
-        log.info(f"Top target values:\n{vc}")
-    except Exception:
-        pass
+        # équilibre simple et tronque
+        df["_m"] = df["PARTITION_MONTH"]
+        per_m = max(1, int(np.ceil(LIMIT_ROWS / max(1, df["_m"].nunique()))))
+        df = (df.groupby("_m", group_keys=False).apply(lambda g: g.head(per_m))).drop(columns=["_m"])
+        df = (df.sort_values(["CLIENT_ID","DATE_EVENT"])
+                .drop_duplicates(subset=["CLIENT_ID","DATE_EVENT"], keep="last")
+                .head(LIMIT_ROWS)
+                .reset_index(drop=True))
+    else:
+        # Pas de partitions => 2 passes max (mois max, puis stream filtré)
+        max_month = _find_max_month_by_scan(ds_in)
+        if not max_month:
+            raise RuntimeError("Impossible de déterminer le mois max (TIME_COL vide ?).")
+        start_month = _month_minus(max_month, MONTHS_BACK_TARGET-1)
+        log.info(f"Aucune partition. max_month={max_month} | start_month={start_month}")
+        df = _stream_filter_last_months(ds_in, start_month, LIMIT_ROWS, EXCLUDE_ON_EVENTS)
 
-    # Écriture (schema auto)
-    ds_out.write_with_schema(df_events)
-    log.info(f" Wrote dataset '{OUTPUT_DATASET_NAME}' with {len(df_events):,} rows.")
-    log.info("=== RECIPE 1 DONE ===")
+    # Stats & écritures
+    if df.empty:
+        raise RuntimeError("Échantillon vide (même après fast path).")
+    n_clients = df["CLIENT_ID"].nunique()
+    n_months  = df["PARTITION_MONTH"].nunique()
+    log.info(f"FAST sample -> rows={len(df):,} | clients={n_clients:,} | months={n_months}")
+
+    ds_out.write_with_schema(df)
+    log.info(f" Wrote dataset '{OUTPUT_DATASET_NAME}' with {len(df):,} rows.")
+    log.info("=== RECIPE 1 FAST DONE ===")
 
 
 if __name__ == "__main__":
