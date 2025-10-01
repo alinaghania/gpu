@@ -1,4 +1,3 @@
-
 # t4rec_toolkit/pipeline_core.py
 # -*- coding: utf-8 -*-
 """
@@ -141,8 +140,8 @@ def blank_config() -> Dict[str, Any]:
             "class_weighting": True,       # pondérer CrossEntropy selon fréquences
             "gradient_clip": 1.0,
             "optimizer": "adamw",
-     # ==== GPU / DataLoader ====
-           "use_amp": True,               # autocast + GradScaler
+            # ==== GPU / DataLoader ====
+            "use_amp": True,               # autocast + GradScaler
             "amp_dtype": "bf16",           # "bf16" (si dispo) sinon "fp16"
             "grad_accumulation_steps": 1,
             "num_workers": 2,              # DataLoader workers
@@ -215,8 +214,6 @@ def _load_events_df(cfg: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
-
-
 def _load_profile_df_if_any(cfg: Dict[str, Any]) -> Optional[pd.DataFrame]:
     """
     Charge la table profil :
@@ -248,7 +245,6 @@ def _load_profile_df_if_any(cfg: Dict[str, Any]) -> Optional[pd.DataFrame]:
     df = ds.get_dataframe(limit=dcfg.get("limit"))
     logger.info(f"Profile loaded: {ds_name} → {df.shape}")
     return df
-
 
 
 def merge_rare_classes(series: pd.Series, min_count: int, other_name: str) -> Tuple[pd.Series, Dict[str, str]]:
@@ -381,7 +377,6 @@ def _build_t4rec_embedding_module(
     return emb, concat_dim
 
 
-
 # ===================== Dataset simple pour DataLoader ======================
 class SeqDictDataset(Dataset):
     def __init__(self, X_dict: Dict[str, torch.Tensor], y: torch.Tensor):
@@ -403,17 +398,18 @@ def collate_batch(batch):
     yb = torch.stack(list(ys), dim=0)
     return xb, yb
 
+
 # ------------------------------------------------------------------
 # 5) ENTRAÎNEMENT
 # ------------------------------------------------------------------
 
 def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Pipeline complet (CPU-only, RAM friendly) :
+    Pipeline complet (GPU/CPU) :
       - construction des séquences temporelles,
       - encodage des features (cat/seq),
       - embeddings T4Rec + Transformer,
-      - training/validation en MINI-BATCHES (beaucoup de logs),
+      - training/validation via DataLoader,
       - métriques + sauvegardes.
     """
     import gc
@@ -424,7 +420,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     _setup_logging(config["runtime"]["verbose"])
     logger = logging.getLogger(__name__)
 
-      # ---------- Device & AMP ----------
+    # ---------- Device & AMP ----------
     dev_override = config["runtime"].get("device_override")
     if dev_override in ("cuda", "cpu"):
         device = torch.device(dev_override)
@@ -607,7 +603,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     split = int(N * (1.0 - config["training"]["val_split"]))
     tr_idx, va_idx = idx[:split], idx[split:]
 
-
     def slice_dict(d: Dict[str, torch.Tensor], ids: np.ndarray) -> Dict[str, torch.Tensor]:
         return {k: v[ids] for k, v in d.items()}
 
@@ -638,6 +633,10 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         max_seq_len=max_T,
         proj_in_dim=concat_dim,
     ).to(device)
+    try:
+        model = torch.compile(model)
+    except Exception:
+        pass
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model params: {n_params:,}")
     log_mem("après construction modèle")
@@ -660,32 +659,27 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-
     # 13) DataLoaders (GPU/CPU)
-      bs = int(config["training"]["batch_size"])
-      bs_eval = max(1, min(bs * 2, 512))
-      grad_clip = config["training"].get("gradient_clip", None)
-      log_every = max(1, 1000 // max(1, bs))
-      num_workers = int(config["training"].get("num_workers", 0))
-      pin_memory  = bool(config["training"].get("pin_memory", False))
-      persist_w   = bool(config["training"].get("persistent_workers", False)) and num_workers > 0
-  
-      train_ds = SeqDictDataset(Xtr_cpu, ytr_cpu)
-      val_ds   = SeqDictDataset(Xva_cpu, yva_cpu)
-      train_loader = DataLoader(
-          train_ds, batch_size=bs, shuffle=True, drop_last=False,
-          num_workers=num_workers, pin_memory=pin_memory,
-          persistent_workers=persist_w, collate_fn=collate_batch
-      )
-      val_loader = DataLoader(
-          val_ds, batch_size=bs_eval, shuffle=False, drop_last=False,
-          num_workers=num_workers, pin_memory=pin_memory,
-          persistent_workers=persist_w, collate_fn=collate_batch
-      )
+    bs = int(config["training"]["batch_size"])
+    bs_eval = max(1, min(bs * 2, 512))
+    grad_clip = config["training"].get("gradient_clip", None)
+    log_every = max(1, 1000 // max(1, bs))
+    num_workers = int(config["training"].get("num_workers", 0))
+    pin_memory  = bool(config["training"].get("pin_memory", False))
+    persist_w   = bool(config["training"].get("persistent_workers", False)) and num_workers > 0
 
-
-  
-
+    train_ds = SeqDictDataset(Xtr_cpu, ytr_cpu)
+    val_ds   = SeqDictDataset(Xva_cpu, yva_cpu)
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, shuffle=True, drop_last=False,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=persist_w, collate_fn=collate_batch
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=bs_eval, shuffle=False, drop_last=False,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=persist_w, collate_fn=collate_batch
+    )
 
     # 14) Training loop (GPU/CPU with AMP)
     logger.info("STEP 6/6 - Entraînement…")
@@ -697,7 +691,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     for epoch in range(num_epochs):
         t_ep = time()
         model.train()
-        tr_loss = 0.0; n_steps = 0; ex_seen = 0
         tr_loss = 0.0; n_steps = 0; ex_seen = 0
         optimizer.zero_grad(set_to_none=True)
 
@@ -725,7 +718,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info(f"[Train] epoch {epoch+1}/{num_epochs} | step {n_steps} | seen={ex_seen}/{len(train_ds)} "
                             f"| batch_loss={(loss.item()*grad_accum):.4f}")
                 log_mem(f"train epoch {epoch+1} step {n_steps}")
-                gc.collect()    
+                gc.collect()
 
         tr_loss /= max(1, n_steps)
 
@@ -733,7 +726,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         model.eval()
         va_loss_sum, n_va, correct = 0.0, 0, 0
         with torch.no_grad():
-            step = 0
             step = 0
             for xb, yb in val_loader:
                 xb = {k: v.to(device, non_blocking=True) for k, v in xb.items()}
@@ -749,8 +741,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 if step % max(1, log_every//2) == 0:
                     logger.info(f"[Val] epoch {epoch+1} | step {step} | processed={n_va}/{len(val_ds)} "
                                 f"| running_val_loss={(va_loss_sum/max(1,n_va)):.4f}")
-
- 
         va_loss = va_loss_sum / max(1, n_va)
         acc = correct / max(1, n_va)
 
@@ -763,7 +753,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     # 15) Final metrics (on regénère les logits en val, batché)
     logger.info("Finalisation — calcul des métriques globales (validation)…")
 
-
     model.eval()
     all_logits = []; all_preds  = []
     with torch.no_grad():
@@ -773,7 +762,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
                 logits = model(xb)
             all_logits.append(logits.detach().to("cpu"))
             all_preds.append(torch.argmax(logits, dim=1).detach().to("cpu"))
-            all_preds.append(torch.argmax(logits, dim=1).detach().cpu())
 
     logits_cat = torch.cat(all_logits, dim=0) if len(all_logits) > 0 else torch.empty((0, n_classes))
     preds_cat  = torch.cat(all_preds,  dim=0) if len(all_preds)  > 0 else torch.empty((0,), dtype=torch.long)
@@ -887,9 +875,6 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-
-
-
 # ------------------------------------------------------------------
 # 6) TOP-K (inchangé, repris de ta version)
 # ------------------------------------------------------------------
@@ -977,6 +962,7 @@ def evaluate_topk_metrics_nbo(predictions, targets, inverse_target_mapping, k_va
         all_metrics[k] = compute_ranking_metrics_at_k(client_ids, labels, scores, products, k)
     return all_metrics, None
 
+
 # =====================================================================
 # Validation de la configuration
 # =====================================================================
@@ -1059,7 +1045,6 @@ def get_config_schema() -> Dict[str, Any]:
     }
 
 
-
 def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
     """
     Valide la config avant entraînement.
@@ -1107,7 +1092,6 @@ def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
                     "model.max_sequence_length doit être >= sequence.months_lookback"
                 )
 
-
     if "data" in config:
         d = config["data"]
 
@@ -1123,6 +1107,7 @@ def validate_config(config: Dict[str, Any], strict: bool = False) -> List[str]:
                 errors.append(f"data.{col_key} est requis (non vide)")
 
     return errors
+
 
 # =====================================================================
 # Affichage des métriques Top-K (pour le notebook)
@@ -1195,3 +1180,4 @@ def print_topk_results(metrics_by_k: Dict[int, Dict[str, float]], baseline_metri
     Affiche le tableau Top-K en console (utilisé par le notebook).
     """
     print(format_topk_table(metrics_by_k, baseline_metrics))
+
