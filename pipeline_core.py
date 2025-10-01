@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
 # ============== T4Rec (embeddings uniquement) =====================
 try:
@@ -140,6 +141,13 @@ def blank_config() -> Dict[str, Any]:
             "class_weighting": True,       # pondérer CrossEntropy selon fréquences
             "gradient_clip": 1.0,
             "optimizer": "adamw",
+     # ==== GPU / DataLoader ====
+           "use_amp": True,               # autocast + GradScaler
+            "amp_dtype": "bf16",           # "bf16" (si dispo) sinon "fp16"
+            "grad_accumulation_steps": 1,
+            "num_workers": 2,              # DataLoader workers
+            "pin_memory": True,
+            "persistent_workers": True,
         },
         "outputs": {
             "features_dataset": "T4REC_FEATURES",
@@ -152,6 +160,7 @@ def blank_config() -> Dict[str, Any]:
             "verbose": True,
             "progress": True,
             "seed": 42,
+            "device_override": None,       # "cuda" | "cpu" | None (auto)
         },
     }
 
@@ -372,6 +381,28 @@ def _build_t4rec_embedding_module(
     return emb, concat_dim
 
 
+
+# ===================== Dataset simple pour DataLoader ======================
+class SeqDictDataset(Dataset):
+    def __init__(self, X_dict: Dict[str, torch.Tensor], y: torch.Tensor):
+        self.X = X_dict
+        self.y = y
+        self.keys = list(X_dict.keys())
+        n = len(y)
+        for k in self.keys:
+            assert len(self.X[k]) == n, f"Feature {k} length mismatch"
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, idx):
+        return ({k: self.X[k][idx] for k in self.keys}, self.y[idx])
+
+def collate_batch(batch):
+    xs, ys = zip(*batch)
+    keys = xs[0].keys()
+    xb = {k: torch.stack([x[k] for x in xs], dim=0) for k in keys}
+    yb = torch.stack(list(ys), dim=0)
+    return xb, yb
+
 # ------------------------------------------------------------------
 # 5) ENTRAÎNEMENT
 # ------------------------------------------------------------------
@@ -393,10 +424,25 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     _setup_logging(config["runtime"]["verbose"])
     logger = logging.getLogger(__name__)
 
-    # ---------- Device (CPU only) ----------
-    device = torch.device("cpu")
-    use_amp = False  # pas d'AMP sur CPU
-    logger.info(" Mode CPU: AMP désactivé, pensez à garder un batch_size très petit (ex: 4..16).")
+      # ---------- Device & AMP ----------
+    dev_override = config["runtime"].get("device_override")
+    if dev_override in ("cuda", "cpu"):
+        device = torch.device(dev_override)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    use_amp = bool(config["training"].get("use_amp", False)) and device.type == "cuda"
+    amp_dtype = str(config["training"].get("amp_dtype", "bf16")).lower()
+    amp_dtype_torch = torch.bfloat16 if amp_dtype == "bf16" else torch.float16
+
+    if device.type == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+            import torch.backends.cudnn as cudnn
+            cudnn.benchmark = True
+        except Exception:
+            pass
+    logger.info(f"Device: {device} | AMP={use_amp} ({amp_dtype})")
 
     # ---------- Seeds ----------
     seed = config["runtime"].get("seed")
@@ -561,6 +607,7 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     split = int(N * (1.0 - config["training"]["val_split"]))
     tr_idx, va_idx = idx[:split], idx[split:]
 
+
     def slice_dict(d: Dict[str, torch.Tensor], ids: np.ndarray) -> Dict[str, torch.Tensor]:
         return {k: v[ids] for k, v in d.items()}
 
@@ -613,52 +660,72 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         loss_fn = nn.CrossEntropyLoss()
 
-    # 13) Data iterator (CPU only)
-    bs = int(config["training"]["batch_size"])
-    # Sur CPU, garder un batch encore + petit si besoin
-    if bs > 16:
-        logger.info(" CPU détecté: je force batch_size <= 16 pour éviter OOM.")
-        bs = 16
-    bs_eval = max(1, min(bs, 128))
-    grad_clip = config["training"].get("gradient_clip", None)
-    log_every = max(1, 1000 // max(1, bs))  # logs réguliers
 
-    def batches(Xcpu: Dict[str, torch.Tensor], ycpu: torch.Tensor, batch_size: int):
-        Nloc = len(ycpu)
-        for s in range(0, Nloc, batch_size):
-            e = min(s + batch_size, Nloc)
-            xb = {k: v[s:e] for k, v in Xcpu.items()}  # tensors CPU
-            yb = ycpu[s:e]
-            yield s, e, xb, yb
+    # 13) DataLoaders (GPU/CPU)
+      bs = int(config["training"]["batch_size"])
+      bs_eval = max(1, min(bs * 2, 512))
+      grad_clip = config["training"].get("gradient_clip", None)
+      log_every = max(1, 1000 // max(1, bs))
+      num_workers = int(config["training"].get("num_workers", 0))
+      pin_memory  = bool(config["training"].get("pin_memory", False))
+      persist_w   = bool(config["training"].get("persistent_workers", False)) and num_workers > 0
+  
+      train_ds = SeqDictDataset(Xtr_cpu, ytr_cpu)
+      val_ds   = SeqDictDataset(Xva_cpu, yva_cpu)
+      train_loader = DataLoader(
+          train_ds, batch_size=bs, shuffle=True, drop_last=False,
+          num_workers=num_workers, pin_memory=pin_memory,
+          persistent_workers=persist_w, collate_fn=collate_batch
+      )
+      val_loader = DataLoader(
+          val_ds, batch_size=bs_eval, shuffle=False, drop_last=False,
+          num_workers=num_workers, pin_memory=pin_memory,
+          persistent_workers=persist_w, collate_fn=collate_batch
+      )
 
-    # 14) Training loop (CPU)
+
+  
+
+
+    # 14) Training loop (GPU/CPU with AMP)
     logger.info("STEP 6/6 - Entraînement…")
     num_epochs = config["training"]["num_epochs"]
     history = []
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    grad_accum = max(1, int(config["training"].get("grad_accumulation_steps", 1)))
 
     for epoch in range(num_epochs):
         t_ep = time()
         model.train()
         tr_loss = 0.0; n_steps = 0; ex_seen = 0
+        tr_loss = 0.0; n_steps = 0; ex_seen = 0
+        optimizer.zero_grad(set_to_none=True)
 
-        for s, e, xb, yb in batches(Xtr_cpu, ytr_cpu, bs):
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(xb)
-            loss   = loss_fn(logits, yb)
-            loss.backward()
-            if grad_clip:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+        for step, (xb, yb) in enumerate(train_loader, start=1):
+            xb = {k: v.to(device, non_blocking=True) for k, v in xb.items()}
+            yb = yb.to(device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype_torch):
+                logits = model(xb)
+                loss   = loss_fn(logits, yb) / grad_accum
+            scaler.scale(loss).backward()
 
-            tr_loss += float(loss.item())
+            if step % grad_accum == 0:
+                if grad_clip:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            tr_loss += float(loss.item()) * grad_accum
             n_steps += 1
-            ex_seen += (e - s)
+            ex_seen += yb.size(0)
 
             if n_steps % log_every == 0:
-                logger.info(f"[Train] epoch {epoch+1}/{num_epochs} | step {n_steps} | seen={ex_seen}/{len(ytr_cpu)} "
-                            f"| batch_loss={loss.item():.4f}")
+                logger.info(f"[Train] epoch {epoch+1}/{num_epochs} | step {n_steps} | seen={ex_seen}/{len(train_ds)} "
+                            f"| batch_loss={(loss.item()*grad_accum):.4f}")
                 log_mem(f"train epoch {epoch+1} step {n_steps}")
-                gc.collect()
+                gc.collect()    
 
         tr_loss /= max(1, n_steps)
 
@@ -667,17 +734,23 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
         va_loss_sum, n_va, correct = 0.0, 0, 0
         with torch.no_grad():
             step = 0
-            for s, e, xb, yb in batches(Xva_cpu, yva_cpu, bs_eval):
-                logits = model(xb)
-                loss   = loss_fn(logits, yb)
+            step = 0
+            for xb, yb in val_loader:
+                xb = {k: v.to(device, non_blocking=True) for k, v in xb.items()}
+                yb = yb.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype_torch):
+                    logits = model(xb)
+                    loss   = loss_fn(logits, yb)
                 va_loss_sum += float(loss.item()) * yb.size(0)
                 preds = torch.argmax(logits, dim=1)
                 correct += int((preds == yb).sum().item())
                 n_va += yb.size(0)
                 step += 1
                 if step % max(1, log_every//2) == 0:
-                    logger.info(f"[Val] epoch {epoch+1} | step {step} | processed={n_va}/{len(yva_cpu)} "
+                    logger.info(f"[Val] epoch {epoch+1} | step {step} | processed={n_va}/{len(val_ds)} "
                                 f"| running_val_loss={(va_loss_sum/max(1,n_va)):.4f}")
+
+ 
         va_loss = va_loss_sum / max(1, n_va)
         acc = correct / max(1, n_va)
 
@@ -689,14 +762,19 @@ def run_training(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # 15) Final metrics (on regénère les logits en val, batché)
     logger.info("Finalisation — calcul des métriques globales (validation)…")
+
+
     model.eval()
-    all_logits = []
-    all_preds  = []
+    all_logits = []; all_preds  = []
     with torch.no_grad():
-        for _, _, xb, yb in batches(Xva_cpu, yva_cpu, bs_eval):
-            logits = model(xb)
-            all_logits.append(logits.detach().cpu())
+        for xb, yb in val_loader:
+            xb = {k: v.to(device, non_blocking=True) for k, v in xb.items()}
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype_torch):
+                logits = model(xb)
+            all_logits.append(logits.detach().to("cpu"))
+            all_preds.append(torch.argmax(logits, dim=1).detach().to("cpu"))
             all_preds.append(torch.argmax(logits, dim=1).detach().cpu())
+
     logits_cat = torch.cat(all_logits, dim=0) if len(all_logits) > 0 else torch.empty((0, n_classes))
     preds_cat  = torch.cat(all_preds,  dim=0) if len(all_preds)  > 0 else torch.empty((0,), dtype=torch.long)
 
